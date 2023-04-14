@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
+import { useRouter } from "next/router";
 
 export default function chat() {
+
   const [messages, setMessages] = useState<string[]>([]);
   const [socket, setSocket] = useState<WebSocket | null>(null);
 
@@ -17,6 +19,31 @@ export default function chat() {
   }
 
   const [ message, setMessage ] = useState<string>('');
+
+  const closeSocket = () => {
+    if (socket) {
+      socket.close();
+    }
+  }
+
+  const router = useRouter()
+
+  const pageChangeHandler = () => {
+    closeSocket();
+  }
+
+  const beforeUnloadhandler = (event:any) => {
+    closeSocket();
+  }
+
+  useEffect(() => {
+    router.events.on('routeChangeStart', pageChangeHandler)
+    window.addEventListener('beforeunload', beforeUnloadhandler)
+    return () => {
+      router.events.off('routeChangeStart', pageChangeHandler)
+      window.removeEventListener('beforeunload', beforeUnloadhandler)
+    }
+  }, [])
 
   return (
     <div>
