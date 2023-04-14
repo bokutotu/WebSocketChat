@@ -1,8 +1,8 @@
-function About() {
+
+export default function about() {
   return (
-    <p>ほら詳しいでしょう</p>
-  )
+    <div>
+      <h1>About</h1>
+    </div>
+      )
 }
-
-export default About
-
