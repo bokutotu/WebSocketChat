@@ -1,23 +1,34 @@
+use axum::extract::connect_info::ConnectInfo;
+use axum::extract::State;
 use axum::{
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
+        ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
         TypedHeader,
     },
     response::IntoResponse,
     routing::get,
     Router,
 };
-use axum::extract::connect_info::ConnectInfo;
 
-use std::ops::ControlFlow;
+use serde::{Deserialize, Serialize};
+
+use tokio::sync::broadcast;
+
 use std::net::SocketAddr;
+// use std::ops::ControlFlow;
+use std::sync::{Arc, Mutex};
+// use std::ops::{Deref, DerefMut};
 
-use futures::{sink::SinkExt, stream::StreamExt};
+use futures::{
+    sink::SinkExt,
+    stream::{SplitSink, SplitStream, StreamExt},
+};
 
 #[tokio::main]
 async fn main() {
-    let app = Router::new()
-        .route("/ws", get(ws_handler));
+    let (tx, _) = broadcast::channel(32);
+    let db = Arc::new(Mutex::new(MessageDb::new(tx)));
+    let app = Router::new().route("/ws", get(ws_handler)).with_state(db);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 1919));
     axum::Server::bind(&addr)
@@ -26,11 +37,11 @@ async fn main() {
         .unwrap();
 }
 
-
 async fn ws_handler(
     ws: WebSocketUpgrade,
     user_agent: Option<TypedHeader<headers::UserAgent>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    state: State<Arc<Mutex<MessageDb>>>,
 ) -> impl IntoResponse {
     let user_agent = if let Some(TypedHeader(user_agent)) = user_agent {
         user_agent.to_string()
@@ -38,111 +49,235 @@ async fn ws_handler(
         String::from("Unknown browser")
     };
     println!("`{user_agent}` at {addr} connected.");
-    ws.on_upgrade(move |socket| handle_socket(socket, addr))
+    ws.on_upgrade(move |socket| handle_socket(ChatWebSocket::new(socket), addr, state))
 }
 
-async fn handle_socket(mut socket: WebSocket, who: SocketAddr) {
-    if socket.send(Message::Ping(vec![1, 2, 3])).await.is_ok() {
-        println!("Pinged {}...", who);
-    } else {
-        println!("Could not send ping {}!", who);
-        return;
-    }
+async fn handle_socket(
+    mut stream: ChatWebSocket,
+    who: SocketAddr,
+    state: State<Arc<Mutex<MessageDb>>>,
+) {
+    // 誰が接続したかを表示する
+    println!("`{who}` connected.");
+    println!(
+        "initial state is {:#?}",
+        state.lock().unwrap().init_message()
+    );
 
-    if let Some(msg) = socket.recv().await {
-        if let Ok(msg) = msg {
-            if process_message(msg, who).is_break() {
-                return;
-            }
-        } else {
-            println!("client {who} abruptly disconnected");
-            return;
-        }
-    }
+    let tx = state.lock().unwrap().tx.clone();
 
+    // 履歴を送信する
+    let v = state.lock().unwrap().init_message();
+    stream
+        .send(SocketMessage::Message(ChatMessage::Init(v)))
+        .await
+        .unwrap();
 
-    let (mut sender, mut receiver) = socket.split();
+    let (mut sender_ws, mut reciver_ws) = stream.split();
 
-    // resv_taskからsend_taskにメッセージを送信するためのチャネル
-    let (tx, mut rx) = tokio::sync::mpsc::channel(32);
-
-    // メッセージを受け取るタスクを起動
-    let recv_task = tokio::spawn(async move {
-        let mut cnt = 0;
-        while let Some(Ok(msg)) = receiver.next().await {
-            cnt += 1;
-
-            if let Message::Text(text) = msg {
-                // メッセージを送信するタスクにメッセージを送信
-                println!("message: {:?} from : {:?}", text, who);
-                tx.send(text).await.unwrap();
-            } else if let Message::Close(_) = msg {
-                // Closeメッセージを受け取ったら、メッセージを送信するタスクにCloseメッセージを送信
-                println!("close: from : {:?}", who);
-                tx.send("close".to_string()).await.unwrap();
-                break;
-            }
-        }
-        cnt
-    });
-    
-    // メッセージを送信するタスクを起動
-    let send_task = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if msg == "close" {
-                // メッセージを受け取るタスクからCloseメッセージを受け取ったら、Closeメッセージを送信して終了
-                sender.send(Message::Close(None)).await.unwrap();
-                break;
-            } else {
-                // メッセージを受け取るタスクからメッセージを受け取ったら、メッセージを送信
-                sender.send(Message::Text(msg)).await.unwrap();
+    // 1. WebSocketの送信を受信
+    // 2. 受信したメッセージをbroadcastに送信
+    // 3. stateを更新
+    let s = state.clone();
+    let mut send_task = tokio::spawn(async move {
+        while let Some(Ok(msg)) = reciver_ws.next().await {
+            let msg = msg;
+            println!("`{who}` sent {msg:?}");
+            tx.send(msg.clone()).unwrap();
+            {
+                let mut state = s.lock().unwrap();
+                state.add_message(msg);
             }
         }
     });
 
-    // tokio::selct!を使って、メッセージを受け取るタスクとメッセージを送信するタスクのどちらかが終了するまで待つ
+    // 1. broadcastからメッセージを受信
+    // 2. WebSocketに送信
+    let mut rx = { state.lock().unwrap().tx.broadcast() };
+    let mut recv_task = tokio::spawn(async move {
+        while let Ok(msg) = rx.recv().await {
+            println!("`{who}` received {msg:?}");
+            sender_ws.send(msg).await.unwrap();
+        }
+    });
+
+    // 両方のタスクが終了するまで待つ
     tokio::select! {
-        _ = recv_task => {
-            println!("end resc_task");
-        }
-        _ = send_task => {
-            println!("{} sent a message", who);
-        }
+        _ = (&mut send_task) => recv_task.abort(),
+        _ = (&mut recv_task) => send_task.abort(),
     }
-
-    println!("Websocket context {} destroyed", who);
 }
 
-/// helper to print contents of messages to stdout. Has special treatment for Close.
-fn process_message(msg: Message, who: SocketAddr) -> ControlFlow<(), ()> {
-    match msg {
-        Message::Text(t) => {
-            println!(">>> {} sent str: {:?}", who, t);
-        }
-        Message::Binary(d) => {
-            println!(">>> {} sent {} bytes: {:?}", who, d.len(), d);
-        }
-        Message::Close(c) => {
-            if let Some(cf) = c {
-                println!(
-                    ">>> {} sent close with code {} and reason `{}`",
-                    who, cf.code, cf.reason
-                );
-            } else {
-                println!(">>> {} somehow sent close message without CloseFrame", who);
-            }
-            return ControlFlow::Break(());
-        }
+/// websocketのwrapper
+/// axumのMessageを使わないようにする
+struct ChatWebSocket {
+    sink: ChatSink,
+    stream: ChatStream,
+}
 
-        Message::Pong(v) => {
-            println!(">>> {} sent pong with {:?}", who, v);
-        }
-        // You should never need to manually handle Message::Ping, as axum's websocket library
-        // will do so for you automagically by replying with Pong and copying the v according to
-        // spec. But if you need the contents of the pings you can see them here.
-        Message::Ping(v) => {
-            println!(">>> {} sent ping with {:?}", who, v);
+impl ChatWebSocket {
+    fn new(socket: WebSocket) -> Self {
+        let (sink, socket) = socket.split();
+        Self {
+            stream: ChatStream::new(socket),
+            sink: ChatSink::new(sink),
         }
     }
-    ControlFlow::Continue(())
+
+    // async fn next(&mut self) -> Option<Result<SocketMessage, axum::Error>> {
+    //     self.stream.next().await.map(|msg| msg.map(Into::into))
+    // }
+
+    async fn send(&mut self, msg: SocketMessage) -> Result<(), axum::Error> {
+        self.sink.send(msg).await.map_err(Into::into)
+    }
+
+    fn split(self) -> (ChatSink, ChatStream) {
+        (self.sink, self.stream)
+    }
+}
+
+struct ChatStream(SplitStream<WebSocket>);
+struct ChatSink(SplitSink<WebSocket, Message>);
+
+impl ChatStream {
+    fn new(socket: SplitStream<WebSocket>) -> Self {
+        Self(socket)
+    }
+
+    async fn next(&mut self) -> Option<Result<SocketMessage, axum::Error>> {
+        self.0.next().await.map(|msg| msg.map(Into::into))
+    }
+}
+
+impl ChatSink {
+    fn new(sink: SplitSink<WebSocket, Message>) -> Self {
+        Self(sink)
+    }
+
+    async fn send(&mut self, msg: SocketMessage) -> Result<(), axum::Error> {
+        self.0.send(msg.into()).await.map_err(Into::into)
+    }
+}
+
+/// チャットのメッセージ
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum ChatMessage {
+    Init(Vec<String>),
+    Text(String),
+}
+
+/// axumのmessageのwrapper
+/// Initの状態を扱えるようにする
+#[derive(Debug, Clone)]
+enum SocketMessage {
+    Message(ChatMessage),
+    Binary(Vec<u8>),
+    Ping(Vec<u8>),
+    Pong(Vec<u8>),
+    Close(Option<CloseFrame<'static>>),
+}
+
+impl From<Message> for SocketMessage {
+    fn from(msg: Message) -> Self {
+        match msg {
+            Message::Text(text) => SocketMessage::Message(ChatMessage::Text(text)),
+            Message::Binary(bin) => SocketMessage::Binary(bin),
+            Message::Ping(ping) => SocketMessage::Ping(ping),
+            Message::Pong(pong) => SocketMessage::Pong(pong),
+            Message::Close(close) => SocketMessage::Close(close),
+        }
+    }
+}
+
+impl From<SocketMessage> for Message {
+    fn from(msg: SocketMessage) -> Self {
+        match msg {
+            SocketMessage::Message(msg) => Message::Text(msg.into()),
+            SocketMessage::Binary(bin) => Message::Binary(bin),
+            SocketMessage::Ping(ping) => Message::Ping(ping),
+            SocketMessage::Pong(pong) => Message::Pong(pong),
+            SocketMessage::Close(close) => Message::Close(close),
+        }
+    }
+}
+
+impl TryFrom<SocketMessage> for ChatMessage {
+    type Error = ();
+
+    fn try_from(msg: SocketMessage) -> Result<Self, Self::Error> {
+        match msg {
+            SocketMessage::Message(msg) => Ok(msg),
+            _ => Err(()),
+        }
+    }
+}
+
+impl From<ChatMessage> for SocketMessage {
+    fn from(msg: ChatMessage) -> Self {
+        SocketMessage::Message(msg)
+    }
+}
+
+impl From<ChatMessage> for String {
+    fn from(msg: ChatMessage) -> Self {
+        serde_json::to_string(&msg).unwrap()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MessageTx(broadcast::Sender<SocketMessage>);
+struct MessageRx(broadcast::Receiver<SocketMessage>);
+
+impl MessageTx {
+    fn new(tx: broadcast::Sender<SocketMessage>) -> Self {
+        Self(tx)
+    }
+
+    fn broadcast(&self) -> MessageRx {
+        MessageRx(self.0.subscribe())
+    }
+
+    fn send<I: Into<SocketMessage>>(
+        &self,
+        msg: I,
+    ) -> Result<usize, broadcast::error::SendError<SocketMessage>> {
+        let msg = msg.into();
+        self.0.send(msg)
+    }
+}
+
+impl MessageRx {
+    async fn recv(&mut self) -> Result<SocketMessage, broadcast::error::RecvError> {
+        self.0.recv().await
+    }
+}
+
+struct MessageDb {
+    messages: Vec<String>,
+    tx: MessageTx,
+}
+
+impl MessageDb {
+    fn new(tx: broadcast::Sender<SocketMessage>) -> Self {
+        Self {
+            messages: Vec::new(),
+            tx: MessageTx::new(tx),
+        }
+    }
+
+    fn add_message<T>(&mut self, msg: T)
+    where
+        T: TryInto<ChatMessage> + Clone + Into<SocketMessage>,
+        <T as TryInto<ChatMessage>>::Error: std::fmt::Debug,
+    {
+        println!("this is add_message");
+        let msg_chat: ChatMessage = msg.try_into().unwrap();
+        let msg_str: String = msg_chat.into();
+        self.messages.push(msg_str);
+    }
+
+    fn init_message(&self) -> Vec<String> {
+        self.messages.clone()
+    }
 }
