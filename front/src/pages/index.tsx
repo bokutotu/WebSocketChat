@@ -17,6 +17,11 @@ export default function Home() {
           About
         </Link>
       </div>
+      <div>
+        <Link href="members">
+          Members
+        </Link>
+      </div>
     </div>
   )
 }

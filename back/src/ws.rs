@@ -3,7 +3,7 @@ use axum::extract::ws::{Message, WebSocket};
 use futures::sink::SinkExt;
 use futures::stream::{SplitSink, SplitStream, StreamExt};
 
-use crate::message::SocketMessage;
+use crate::message::WebSocketMessageType;
 
 /// websocketのwrapper
 /// axumのMessageを使わないようにする
@@ -21,11 +21,7 @@ impl ChatWebSocket {
         }
     }
 
-    // async fn next(&mut self) -> Option<Result<SocketMessage, axum::Error>> {
-    //     self.stream.next().await.map(|msg| msg.map(Into::into))
-    // }
-
-    pub async fn send(&mut self, msg: SocketMessage) -> Result<(), axum::Error> {
+    pub async fn send(&mut self, msg: WebSocketMessageType) -> Result<(), axum::Error> {
         self.sink.send(msg).await.map_err(Into::into)
     }
 
@@ -42,7 +38,7 @@ impl ChatStream {
         Self(socket)
     }
 
-    pub async fn next(&mut self) -> Option<Result<SocketMessage, axum::Error>> {
+    pub async fn next(&mut self) -> Option<Result<WebSocketMessageType, axum::Error>> {
         self.0.next().await.map(|msg| msg.map(Into::into))
     }
 }
@@ -52,7 +48,7 @@ impl ChatSink {
         Self(sink)
     }
 
-    pub async fn send(&mut self, msg: SocketMessage) -> Result<(), axum::Error> {
+    pub async fn send(&mut self, msg: WebSocketMessageType) -> Result<(), axum::Error> {
         self.0.send(msg.into()).await.map_err(Into::into)
     }
 }

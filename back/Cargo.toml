@@ -12,3 +12,6 @@ futures = "0.3"
 headers = "0.3"
 serde = { version = "*", features = ["derive"] }
 serde_json = "*"
+uuid = { version = "*", features = ["serde", "v4"] }
+tower-http = { version = "*", features = ["cors"] }
+http = "*"

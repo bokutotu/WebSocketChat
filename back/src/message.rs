@@ -1,68 +1,96 @@
 use axum::extract::ws::{CloseFrame, Message};
 use serde::{Deserialize, Serialize};
+
+use uuid::Uuid;
+
 use std::convert::TryFrom;
+
+use crate::db::{MessageRoom, Comment};
+
+/// メッセージの送受信の際に使用する構造体
+/// メッセージルームのid(usize)
+/// メッセージの送信主(string)
+/// メッセージの内容(string)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoomMessage {
+    pub room_id: Uuid,
+    pub comment: Comment,
+}
 
 /// チャットのメッセージ
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ChatMessage {
-    Init(Vec<String>),
-    Text(String),
+pub enum ChatMessageType {
+    Init(Vec<Comment>),
+    RoomMessage(RoomMessage),
+    Rooms(Vec<String>),
+}
+
+impl ChatMessageType {
+    pub fn into_room_message(self) -> Option<RoomMessage> {
+        match self {
+            ChatMessageType::RoomMessage(msg) => Some(msg),
+            _ => None,
+        }
+    }
 }
 
 /// axumのmessageのwrapper
 /// Initの状態を扱えるようにする
 #[derive(Debug, Clone)]
-pub enum SocketMessage {
-    Message(ChatMessage),
+pub enum WebSocketMessageType {
+    Message(ChatMessageType),
     Binary(Vec<u8>),
     Ping(Vec<u8>),
     Pong(Vec<u8>),
     Close(Option<CloseFrame<'static>>),
 }
 
-impl From<Message> for SocketMessage {
+impl From<Message> for WebSocketMessageType {
     fn from(msg: Message) -> Self {
         match msg {
-            Message::Text(text) => SocketMessage::Message(ChatMessage::Text(text)),
-            Message::Binary(bin) => SocketMessage::Binary(bin),
-            Message::Ping(ping) => SocketMessage::Ping(ping),
-            Message::Pong(pong) => SocketMessage::Pong(pong),
-            Message::Close(close) => SocketMessage::Close(close),
+            Message::Text(text) => { 
+                let msg = serde_json::from_str(&text).unwrap();
+                WebSocketMessageType::Message(msg)
+            },
+            Message::Binary(bin) => WebSocketMessageType::Binary(bin),
+            Message::Ping(ping) => WebSocketMessageType::Ping(ping),
+            Message::Pong(pong) => WebSocketMessageType::Pong(pong),
+            Message::Close(close) => WebSocketMessageType::Close(close),
         }
     }
 }
 
-impl From<SocketMessage> for Message {
-    fn from(msg: SocketMessage) -> Self {
+impl From<WebSocketMessageType> for Message {
+    fn from(msg: WebSocketMessageType) -> Self {
         match msg {
-            SocketMessage::Message(msg) => Message::Text(msg.into()),
-            SocketMessage::Binary(bin) => Message::Binary(bin),
-            SocketMessage::Ping(ping) => Message::Ping(ping),
-            SocketMessage::Pong(pong) => Message::Pong(pong),
-            SocketMessage::Close(close) => Message::Close(close),
+            WebSocketMessageType::Message(msg) => Message::Text(msg.into()),
+            WebSocketMessageType::Binary(bin) => Message::Binary(bin),
+            WebSocketMessageType::Ping(ping) => Message::Ping(ping),
+            WebSocketMessageType::Pong(pong) => Message::Pong(pong),
+            WebSocketMessageType::Close(close) => Message::Close(close),
         }
     }
 }
 
-impl TryFrom<SocketMessage> for ChatMessage {
+impl TryFrom<WebSocketMessageType> for ChatMessageType {
     type Error = ();
 
-    fn try_from(msg: SocketMessage) -> Result<Self, Self::Error> {
+    fn try_from(msg: WebSocketMessageType) -> Result<Self, Self::Error> {
         match msg {
-            SocketMessage::Message(msg) => Ok(msg),
+            WebSocketMessageType::Message(msg) => Ok(msg),
             _ => Err(()),
         }
     }
 }
 
-impl From<ChatMessage> for SocketMessage {
-    fn from(msg: ChatMessage) -> Self {
-        SocketMessage::Message(msg)
+impl From<ChatMessageType> for WebSocketMessageType {
+    fn from(msg: ChatMessageType) -> Self {
+        WebSocketMessageType::Message(msg)
     }
 }
 
-impl From<ChatMessage> for String {
-    fn from(msg: ChatMessage) -> Self {
+impl From<ChatMessageType> for String {
+    fn from(msg: ChatMessageType) -> Self {
         serde_json::to_string(&msg).unwrap()
     }
 }
