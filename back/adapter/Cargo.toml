@@ -6,3 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+kernel = { path = "../kernel" }
+sqlx = { version = "0.5", features = ["runtime-tokio-rustls", "mysql", "chrono"] }
+anyhow = "1.0.70"
+async-trait = "0.1.51"
